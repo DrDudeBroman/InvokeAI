@@ -8,30 +8,37 @@
 #
 print('Loading Python libraries...\n')
 import argparse
-import sys
 import os
 import re
-import warnings
 import shutil
-from urllib import request
-from tqdm import tqdm
-from omegaconf import OmegaConf
-from huggingface_hub import HfFolder, hf_hub_url
+import sys
+import traceback
+import warnings
 from pathlib import Path
-from typing import Union
+from typing import Dict, Union
+from urllib import request
+
+import requests
+import transformers
+from diffusers import StableDiffusionPipeline, AutoencoderKL
 from getpass_asterisk import getpass_asterisk
+from huggingface_hub import HfFolder, hf_hub_url, whoami as hf_whoami
+from omegaconf import OmegaConf
+from tqdm import tqdm
 from transformers import CLIPTokenizer, CLIPTextModel
+
 from ldm.invoke.globals import Globals
 from ldm.invoke.readline import generic_completer
 
-import traceback
-import requests
-import clip
-import transformers
-import warnings
 warnings.filterwarnings('ignore')
 import torch
 transformers.logging.set_verbosity_error()
+
+try:
+    from ldm.invoke.model_cache import ModelCache
+except ImportError:
+    sys.path.append('.')
+    from ldm.invoke.model_cache import ModelCache
 
 #--------------------------globals-----------------------
 Model_dir = 'models'
@@ -285,6 +292,19 @@ def download_weight_datasets(models:dict, access_token:str):
     return successful
 
 #---------------------------------------------
+def is_huggingface_authenticated():
+    # huggingface_hub 0.10 API isn't great for this, it could be OSError, ValueError,
+    # maybe other things, not all end-user-friendly.
+    # noinspection PyBroadException
+    try:
+        response = hf_whoami()
+        if response.get('id') is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+#---------------------------------------------
 def hf_download_with_resume(repo_id:str, model_dir:str, model_name:str, access_token:str=None)->bool:
     model_dest = os.path.join(model_dir, model_name)
     os.makedirs(model_dir, exist_ok=True)
@@ -349,6 +369,58 @@ def download_with_progress_bar(model_url:str, model_dest:str, label:str='the'):
         print('...download failed')
         print(f'Error downloading {label} model')
         print(traceback.format_exc())
+
+
+#---------------------------------------------
+def download_diffusers(models: Dict, full_precision: bool):
+    # This is a minimal implementation until https://github.com/invoke-ai/InvokeAI/pull/1490 lands,
+    # which moves a bunch of stuff.
+    # We can be more complete after we know it won't be all merge conflicts.
+    diffusers_repos = {
+        'CompVis/stable-diffusion-v1-4-original': 'CompVis/stable-diffusion-v1-4',
+        'runwayml/stable-diffusion-v1-5': 'runwayml/stable-diffusion-v1-5',
+        'runwayml/stable-diffusion-inpainting': 'runwayml/stable-diffusion-inpainting',
+        'hakurei/waifu-diffusion-v1-3': 'hakurei/waifu-diffusion'
+    }
+    vae_repos = {
+        'stabilityai/sd-vae-ft-mse-original': 'stabilityai/sd-vae-ft-mse',
+    }
+    precision_args = {}
+    if not full_precision:
+        precision_args.update(revision='fp16')
+
+    for model_name, model in models.items():
+        repo_id = model['repo_id']
+        if repo_id in vae_repos:
+            print(f" * Downloading diffusers VAE {model_name}...")
+            # TODO: can we autodetect when a repo has no fp16 revision?
+            AutoencoderKL.from_pretrained(repo_id)
+        elif repo_id not in diffusers_repos:
+            print(f" * Downloading diffusers {model_name}...")
+            StableDiffusionPipeline.from_pretrained(repo_id, **precision_args)
+        else:
+            warnings.warn(f" ⚠ FIXME: add diffusers repo for {repo_id}")
+            continue
+
+
+def download_diffusers_in_config(config_path: Path, full_precision: bool):
+    # This is a minimal implementation until https://github.com/invoke-ai/InvokeAI/pull/1490 lands,
+    # which moves a bunch of stuff.
+    # We can be more complete after we know it won't be all merge conflicts.
+    if not is_huggingface_authenticated():
+        print("*⚠ No Hugging Face access token; some downloads may be blocked.")
+
+    precision = 'full' if full_precision else 'float16'
+    cache = ModelCache(OmegaConf.load(config_path), precision=precision,
+                       device_type='cpu', max_loaded_models=1)
+    for model_name in cache.list_models():
+        # TODO: download model without loading it.
+        #   https://github.com/huggingface/diffusers/issues/1301
+        model_config = cache.config[model_name]
+        if model_config.get('format') == 'diffusers':
+            print(f" * Downloading diffusers {model_name}...")
+            cache.get_model(model_name)
+            cache.offload_model(model_name)
 
 
 #---------------------------------------------
@@ -423,7 +495,7 @@ def download_bert():
     print('Installing bert tokenizer (ignore deprecation errors)...', end='',file=sys.stderr)
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', category=DeprecationWarning)
-        from transformers import BertTokenizerFast, AutoFeatureExtractor
+        from transformers import BertTokenizerFast
         download_from_hf(BertTokenizerFast,'bert-base-uncased')
         print('...success',file=sys.stderr)
 
@@ -731,6 +803,12 @@ def main():
                         action=argparse.BooleanOptionalAction,
                         default=True,
                         help='run in interactive mode (default)')
+    parser.add_argument('--full-precision',
+                        dest='full_precision',
+                        action=argparse.BooleanOptionalAction,
+                        type=bool,
+                        default=False,
+                        help='use 32-bit weights instead of faster 16-bit weights')
     parser.add_argument('--yes','-y',
                         dest='yes_to_all',
                         action='store_true',
@@ -766,6 +844,12 @@ def main():
         if opt.interactive:
             print('** DOWNLOADING DIFFUSION WEIGHTS **')
             errors.add(download_weights(opt))
+        else:
+            config_path = Path(Globals.root, opt.config_file or Default_config_file)
+            if config_path.exists():
+                download_diffusers_in_config(config_path, full_precision=opt.full_precision)
+            else:
+                print(f"*⚠ No config file found; downloading no weights. Looked in {config_path}")
         print('\n** DOWNLOADING SUPPORT MODELS **')
         download_bert()
         download_clip()

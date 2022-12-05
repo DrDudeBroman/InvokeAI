@@ -1,11 +1,11 @@
 '''
 ldm.invoke.generator.txt2img inherits from ldm.invoke.generator
 '''
-
+import PIL.Image
 import torch
-import numpy as  np
-from ldm.invoke.generator.base import Generator
-from ldm.models.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserComponent
+
+from .base import Generator
+from .diffusers_pipeline import StableDiffusionGeneratorPipeline
 
 
 class Txt2Img(Generator):
@@ -14,7 +14,8 @@ class Txt2Img(Generator):
 
     @torch.no_grad()
     def get_make_image(self,prompt,sampler,steps,cfg_scale,ddim_eta,
-                       conditioning,width,height,step_callback=None,threshold=0.0,perlin=0.0,**kwargs):
+                       conditioning,width,height,step_callback=None,threshold=0.0,perlin=0.0,
+                       **kwargs):
         """
         Returns a function returning an image derived from the prompt and the initial image
         Return value depends on the seed at the time you call it
@@ -23,38 +24,32 @@ class Txt2Img(Generator):
         self.perlin = perlin
         uc, c, extra_conditioning_info   = conditioning
 
-        @torch.no_grad()
-        def make_image(x_T):
-            shape = [
-                self.latent_channels,
-                height // self.downsampling_factor,
-                width  // self.downsampling_factor,
-            ]
+        # noinspection PyTypeChecker
+        pipeline: StableDiffusionGeneratorPipeline = self.model
+        pipeline.scheduler = sampler
 
-            if self.free_gpu_mem and self.model.model.device != self.model.device:
-                self.model.model.to(self.model.device)
-                                
-            sampler.make_schedule(ddim_num_steps=steps, ddim_eta=ddim_eta, verbose=False)
+        def make_image(x_T) -> PIL.Image.Image:
+            # FIXME: restore free_gpu_mem functionality
+            # if self.free_gpu_mem and self.model.model.device != self.model.device:
+            #     self.model.model.to(self.model.device)
 
-            samples, _ = sampler.sample(
-                batch_size                   = 1,
-                S                            = steps,
-                x_T                          = x_T,
-                conditioning                 = c,
-                shape                        = shape,
-                verbose                      = False,
-                unconditional_guidance_scale = cfg_scale,
-                unconditional_conditioning   = uc,
-                extra_conditioning_info      = extra_conditioning_info,
-                eta                          = ddim_eta,
-                img_callback                 = step_callback,
-                threshold                    = threshold,
+            pipeline_output = pipeline.image_from_embeddings(
+                latents=x_T,
+                num_inference_steps=steps,
+                text_embeddings=c,
+                unconditioned_embeddings=uc,
+                guidance_scale=cfg_scale,
+                callback=step_callback,
+                extra_conditioning_info=extra_conditioning_info,
+                # TODO: eta = ddim_eta,
+                # TODO: threshold = threshold,
             )
 
-            if self.free_gpu_mem:
-                self.model.model.to("cpu")
+            # FIXME: restore free_gpu_mem functionality
+            # if self.free_gpu_mem:
+            #     self.model.model.to("cpu")
 
-            return self.sample_to_image(samples)
+            return pipeline.numpy_to_pil(pipeline_output.images)[0]
 
         return make_image
 

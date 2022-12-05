@@ -1,28 +1,33 @@
 '''
-Manage a cache of Stable Diffusion model files for fast switching. 
+Manage a cache of Stable Diffusion model files for fast switching.
 They are moved between GPU and CPU as necessary. If CPU memory falls
 below a preset minimum, the least recently used model will be
 cleared and loaded from disk when next needed.
 '''
+from __future__ import annotations
 
-import torch
-import os
-import io
-import time
+import contextlib
 import gc
 import hashlib
-import psutil
+import io
+import os
 import sys
-import transformers
-import traceback
 import textwrap
-import contextlib
+import time
+import traceback
+import warnings
+from pathlib import Path
 from typing import Union
+
+import torch
+import transformers
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigAttributeError
-from ldm.util import instantiate_from_config, ask_user
-from ldm.invoke.globals import Globals
 from picklescan.scanner import scan_file_path
+
+from ldm.invoke.generator.diffusers_pipeline import StableDiffusionGeneratorPipeline
+from ldm.invoke.globals import Globals
+from ldm.util import instantiate_from_config, ask_user
 
 DEFAULT_MAX_MODELS=2
 
@@ -51,7 +56,7 @@ class ModelCache(object):
         identifier.
         '''
         return model_name in self.config
-    
+
     def get_model(self, model_name:str):
         '''
         Given a model named identified in models.yaml, return
@@ -66,7 +71,7 @@ class ModelCache(object):
             if model_name not in self.models: # make room for a new one
                 self._make_cache_room()
             self.offload_model(self.current_model)
-        
+
         if model_name in self.models:
             requested_model = self.models[model_name]['model']
             print(f'>> Retrieving model {model_name} from system RAM cache')
@@ -92,7 +97,7 @@ class ModelCache(object):
                 print(f'** restoring {self.current_model}')
                 self.get_model(self.current_model)
                 return
-        
+
         self.current_model = model_name
         self._push_newest_model(model_name)
         return {
@@ -102,7 +107,7 @@ class ModelCache(object):
             'hash': hash
         }
 
-    def default_model(self) -> str:
+    def default_model(self) -> str | None:
         '''
         Returns the name of the default model, or None
         if none is defined.
@@ -191,19 +196,53 @@ class ModelCache(object):
         omega[model_name] = config
         if clobber:
             self._invalidate_cached_model(model_name)
-    
+
     def _load_model(self, model_name:str):
         """Load and initialize the model from configuration variables passed at object creation time"""
         if model_name not in self.config:
             print(f'"{model_name}" is not a known model name. Please check your models.yaml file')
 
         mconfig = self.config[model_name]
+
+        # for usage statistics
+        if self._has_cuda():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+
+        tic = time.time()
+
+        # this does the work
+        model_format = mconfig.get('format', 'ckpt')
+        if model_format == 'ckpt':
+            weights = mconfig.weights
+            print(f'>> Loading {model_name} from {weights}')
+            model, width, height, model_hash = self._load_ckpt_model(model_name, mconfig)
+        elif model_format == 'diffusers':
+            model, width, height, model_hash = self._load_diffusers_model(mconfig)
+        else:
+            raise NotImplementedError(f"Unknown model format {model_name}: {model_format}")
+
+        # usage statistics
+        toc = time.time()
+        print(f'>> Model loaded in', '%4.2fs' % (toc - tic))
+        if self._has_cuda():
+            print(
+                '>> Max VRAM used to load the model:',
+                '%4.2fG' % (torch.cuda.max_memory_allocated() / 1e9),
+                '\n>> Current VRAM usage:'
+                '%4.2fG' % (torch.cuda.memory_allocated() / 1e9),
+            )
+        return model, width, height, model_hash
+
+    def _load_ckpt_model(self, model_name, mconfig):
         config = mconfig.config
         weights = mconfig.weights
         vae = mconfig.get('vae')
         width = mconfig.width
         height = mconfig.height
 
+        if not os.path.isabs(config):
+            config = os.path.join(Globals.root,config)
         if not os.path.isabs(weights):
             weights = os.path.normpath(os.path.join(Globals.root,weights))
         # scan model
@@ -224,7 +263,7 @@ class ModelCache(object):
         omega_config = OmegaConf.load(config)
         with open(weights,'rb') as f:
             weight_bytes = f.read()
-        model_hash  = self._cached_sha256(weights,weight_bytes)
+        model_hash = self._cached_sha256(weights, weight_bytes)
         sd = torch.load(io.BytesIO(weight_bytes), map_location='cpu')
         del weight_bytes
         sd = sd['state_dict']
@@ -252,7 +291,7 @@ class ModelCache(object):
         model.to(self.device)
         # model.to doesn't change the cond_stage_model.device used to move the tokenizer output, so set it here
         model.cond_stage_model.device = self.device
-        
+
         model.eval()
 
         for module in model.modules():
@@ -272,7 +311,60 @@ class ModelCache(object):
             )
 
         return model, width, height, model_hash
-        
+
+    def _load_diffusers_model(self, mconfig):
+        pipeline_args = {}
+
+        if 'repo_name' in mconfig:
+            name_or_path = mconfig['repo_name']
+            model_hash = "FIXME"
+            # model_hash = huggingface_hub.get_hf_file_metadata(url).commit_hash
+        elif 'path' in mconfig:
+            name_or_path = Path(mconfig['path'])
+            # FIXME: What should the model_hash be? A hash of the unet weights? Of all files of all
+            #     the submodels hashed together? The commit ID from the repo?
+            model_hash = "FIXME TOO"
+        else:
+            raise ValueError("Model config must specify either repo_name or path.")
+
+        print(f'>> Loading diffusers model from {name_or_path}')
+
+        # TODO: scan weights maybe?
+
+        if self.precision == 'float16':
+            print('   | Using faster float16 precision')
+            pipeline_args.update(revision="fp16", torch_dtype=torch.float16)
+        else:
+            # TODO: more accurately, "using the model's default precision."
+            #     How do we find out what that is?
+            print('   | Using more accurate float32 precision')
+
+        pipeline = StableDiffusionGeneratorPipeline.from_pretrained(
+            name_or_path,
+            safety_checker=None,  # TODO
+            # TODO: alternate VAE
+            # TODO: local_files_only=True
+            **pipeline_args
+        )
+        pipeline.to(self.device)
+
+        width = pipeline.vae.block_out_channels[-1]
+        height = pipeline.vae.block_out_channels[-1]
+
+        return pipeline, width, height, model_hash
+
+    def model_name_or_path(self, model_name:str) -> str | Path:
+        if model_name not in self.config:
+            raise ValueError(f'"{model_name}" is not a known model name. Please check your models.yaml file')
+
+        mconfig = self.config[model_name]
+        if 'repo_name' in mconfig:
+            return mconfig['repo_name']
+        elif 'path' in mconfig:
+            return Path(mconfig['path'])
+        else:
+            raise ValueError("Model config must specify either repo_name or path.")
+
     def offload_model(self, model_name:str) -> None:
         '''
         Offload the indicated model to CPU. Will call
@@ -288,7 +380,7 @@ class ModelCache(object):
         gc.collect()
         if self._has_cuda():
             torch.cuda.empty_cache()
-    
+
     def scan_model(self, model_name, checkpoint):
         # scan model
         print(f'>> Scanning Model: {model_name}')
@@ -318,7 +410,7 @@ class ModelCache(object):
             if least_recent_model is not None:
                 del self.models[least_recent_model]
                 gc.collect()
-        
+
     def print_vram_usage(self) -> None:
         if self._has_cuda:
             print('>> Current VRAM usage: ','%4.2fG' % (torch.cuda.memory_allocated() / 1e9))
@@ -353,13 +445,16 @@ class ModelCache(object):
         if model_name in self.stack:
             self.stack.remove(model_name)
         self.models.pop(model_name,None)
-        
+
     def _model_to_cpu(self,model):
         if self.device != 'cpu':
-            model.cond_stage_model.device = 'cpu'
-            model.first_stage_model.to('cpu')
-            model.cond_stage_model.to('cpu') 
-            model.model.to('cpu')
+            try:
+                model.cond_stage_model.device = 'cpu'
+                model.first_stage_model.to('cpu')
+                model.cond_stage_model.to('cpu')
+                model.model.to('cpu')
+            except AttributeError as e:
+                warnings.warn(f"TODO: clean up legacy model-management: {e}")
             return model.to('cpu')
         else:
             return model
@@ -388,7 +483,7 @@ class ModelCache(object):
         with contextlib.suppress(ValueError):
             self.stack.remove(model_name)
         self.stack.append(model_name)
-        
+
     def _has_cuda(self) -> bool:
         return self.device.type == 'cuda'
 

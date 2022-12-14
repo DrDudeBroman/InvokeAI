@@ -1,22 +1,23 @@
 '''
 ldm.invoke.generator.inpaint descends from ldm.invoke.generator
 '''
-from __future__ import annotations
 
 import math
-
-import PIL
-import cv2
-import numpy as np
 import torch
+import torchvision.transforms as T
+import numpy as  np
+import cv2 as cv
+import PIL
 from PIL import Image, ImageFilter, ImageOps, ImageChops
-from einops import repeat
-
+from skimage.exposure.histogram_matching import match_histograms
+from einops import rearrange, repeat
+from ldm.invoke.devices             import choose_autocast
+from ldm.invoke.generator.img2img   import Img2Img
+from ldm.models.diffusion.ddim     import DDIMSampler
+from ldm.models.diffusion.ksampler import KSampler
 from ldm.invoke.generator.base import downsampling
-from ldm.invoke.generator.diffusers_pipeline import image_resized_to_grid_as_tensor, StableDiffusionGeneratorPipeline
-from ldm.invoke.generator.img2img import Img2Img
-from ldm.invoke.globals import Globals
 from ldm.util import debug_image
+from ldm.invoke.globals import Globals
 
 infill_methods: list[str] = list()
 
@@ -35,9 +36,6 @@ infill_methods.append('tile')
 
 class Inpaint(Img2Img):
     def __init__(self, model, precision):
-        self.inpaint_height = 0
-        self.inpaint_width = 0
-        self.enable_image_debugging = False
         self.init_latent = None
         self.pil_image = None
         self.pil_mask = None
@@ -61,7 +59,7 @@ class Inpaint(Img2Img):
             writeable=False
         )
 
-    def infill_patchmatch(self, im: Image.Image) -> Image:
+    def infill_patchmatch(self, im: Image.Image) -> Image:        
         if im.mode != 'RGBA':
             return im
 
@@ -125,13 +123,13 @@ class Inpaint(Img2Img):
         npgradient = np.uint8(255 * (1.0 - np.floor(np.abs(0.5 - np.float32(npimg) / 255.0) * 2.0)))
 
         # Detect hard edges
-        npedge = cv2.Canny(npimg, threshold1=100, threshold2=200)
+        npedge = cv.Canny(npimg, threshold1=100, threshold2=200)
 
         # Combine
         npmask = npgradient + npedge
 
-        # Expand
-        npmask = cv2.dilate(npmask, np.ones((3,3), np.uint8), iterations = int(edge_size / 2))
+        # Expand 
+        npmask = cv.dilate(npmask, np.ones((3,3), np.uint8), iterations = int(edge_size / 2))
 
         new_mask = Image.fromarray(npmask)
 
@@ -141,8 +139,15 @@ class Inpaint(Img2Img):
         return ImageOps.invert(new_mask)
 
 
-    def seam_paint(self, im: Image.Image, seam_size: int, seam_blur: int, prompt, sampler, steps, cfg_scale, ddim_eta,
-                   conditioning, strength, noise, infill_method, step_callback) -> Image.Image:
+    def seam_paint(self,
+        im: Image.Image,
+        seam_size: int,
+        seam_blur: int,
+        prompt,sampler,steps,cfg_scale,ddim_eta,
+        conditioning,strength,
+        noise,
+        step_callback
+    ) -> Image.Image:
         hard_mask = self.pil_image.split()[-1].copy()
         mask = self.mask_edge(hard_mask, seam_size, seam_blur)
 
@@ -160,8 +165,7 @@ class Inpaint(Img2Img):
             seam_size = 0,
             step_callback = step_callback,
             inpaint_width = im.width,
-            inpaint_height = im.height,
-            infill_method = infill_method
+            inpaint_height = im.height
         )
 
         seam_noise = self.get_noise(im.width, im.height)
@@ -173,10 +177,7 @@ class Inpaint(Img2Img):
 
     @torch.no_grad()
     def get_make_image(self,prompt,sampler,steps,cfg_scale,ddim_eta,
-                       conditioning,
-                       init_image: PIL.Image.Image | torch.FloatTensor,
-                       mask_image: PIL.Image.Image | torch.FloatTensor,
-                       strength: float,
+                       conditioning,init_image,mask_image,strength,
                        mask_blur_radius: int = 8,
                        # Seam settings - when 0, doesn't fill seam
                        seam_size: int = 0,
@@ -220,9 +221,9 @@ class Inpaint(Img2Img):
                 init_filled = init_filled.resize((inpaint_width, inpaint_height))
 
             debug_image(init_filled, "init_filled", debug_status=self.enable_image_debugging)
-
+            
             # Create init tensor
-            init_image = image_resized_to_grid_as_tensor(init_filled.convert('RGB'))
+            init_image = self._image_to_tensor(init_filled.convert('RGB'))
 
         if isinstance(mask_image, PIL.Image.Image):
             self.pil_mask = mask_image.copy()
@@ -243,19 +244,29 @@ class Inpaint(Img2Img):
                 ),
                 resample=Image.Resampling.NEAREST
             )
-            mask_image = image_resized_to_grid_as_tensor(mask_image, normalize=False)
+            mask_image = self._image_to_tensor(mask_image,normalize=False)
 
         self.mask_blur_radius = mask_blur_radius
 
         # klms samplers not supported yet, so ignore previous sampler
-        # if isinstance(sampler,KSampler):
-        #     print(
-        #         ">> Using recommended DDIM sampler for inpainting."
-        #     )
-        #     sampler = DDIMSampler(self.model, device=self.model.device)
+        if isinstance(sampler,KSampler):
+            print(
+                f">> Using recommended DDIM sampler for inpainting."
+            )
+            sampler = DDIMSampler(self.model, device=self.model.device)
+        
+        sampler.make_schedule(
+            ddim_num_steps=steps, ddim_eta=ddim_eta, verbose=False
+        )
 
         mask_image = mask_image[0][0].unsqueeze(0).repeat(4,1,1).unsqueeze(0)
         mask_image = repeat(mask_image, '1 ... -> b ...', b=1)
+
+        scope = choose_autocast(self.precision)
+        with scope(self.model.device.type):
+            self.init_latent = self.model.get_first_stage_encoding(
+                self.model.encode_first_stage(init_image)
+            ) # move to latent space
 
         t_enc   = int(strength * steps)
         # todo: support cross-attention control
@@ -263,48 +274,55 @@ class Inpaint(Img2Img):
 
         print(f">> target t_enc is {t_enc} steps")
 
-        # noinspection PyTypeChecker
-        pipeline: StableDiffusionGeneratorPipeline = self.model
-        pipeline.scheduler = sampler
-
+        @torch.no_grad()
         def make_image(x_T):
-            # FIXME: some of this z_enc and inpaint_replace stuff was probably important
             # encode (scaled latent)
-            # z_enc = sampler.stochastic_encode(
-            #     self.init_latent,
-            #     torch.tensor([t_enc]).to(self.model.device),
-            #     noise=x_T
-            # )
-            #
-            # # to replace masked area with latent noise, weighted by inpaint_replace strength
-            # if inpaint_replace > 0.0:
-            #     print(f'>> inpaint will replace what was under the mask with a strength of {inpaint_replace}')
-            #     l_noise = self.get_noise(kwargs['width'],kwargs['height'])
-            #     inverted_mask = 1.0-mask_image  # there will be 1s where the mask is
-            #     masked_region = (1.0-inpaint_replace) * inverted_mask * z_enc + inpaint_replace * inverted_mask * l_noise
-            #     z_enc   = z_enc * mask_image + masked_region
-
-            pipeline_output = pipeline.inpaint_from_embeddings(
-                init_image=init_image,
-                mask_image=mask_image,
-                strength=strength,
-                num_inference_steps=steps,
-                text_embeddings=c,
-                unconditioned_embeddings=uc,
-                guidance_scale=cfg_scale,
-                noise_func=self.get_noise_like,
-                callback=step_callback,
+            z_enc = sampler.stochastic_encode(
+                self.init_latent,
+                torch.tensor([t_enc]).to(self.model.device),
+                noise=x_T
             )
 
-            result = pipeline.numpy_to_pil(pipeline_output.images)[0]
+            # to replace masked area with latent noise, weighted by inpaint_replace strength
+            if inpaint_replace > 0.0:
+                print(f'>> inpaint will replace what was under the mask with a strength of {inpaint_replace}')
+                l_noise = self.get_noise(kwargs['width'],kwargs['height'])
+                inverted_mask = 1.0-mask_image  # there will be 1s where the mask is
+                masked_region = (1.0-inpaint_replace) * inverted_mask * z_enc + inpaint_replace * inverted_mask * l_noise
+                z_enc   = z_enc * mask_image + masked_region
+
+            # decode it
+            samples = sampler.decode(
+                z_enc,
+                c,
+                t_enc,
+                img_callback                 = step_callback,
+                unconditional_guidance_scale = cfg_scale,
+                unconditional_conditioning = uc,
+                mask                       = mask_image,
+                init_latent                = self.init_latent
+            )
+
+            result = self.sample_to_image(samples)
 
             # Seam paint if this is our first pass (seam_size set to 0 during seam painting)
             if seam_size > 0:
                 old_image = self.pil_image or init_image
                 old_mask = self.pil_mask or mask_image
 
-                result = self.seam_paint(result, seam_size, seam_blur, prompt, sampler, seam_steps, cfg_scale, ddim_eta,
-                                         conditioning, seam_strength, x_T, infill_method, step_callback)
+                result = self.seam_paint(
+                    result,
+                    seam_size,
+                    seam_blur,
+                    prompt,
+                    sampler,
+                    seam_steps,
+                    cfg_scale,
+                    ddim_eta,
+                    conditioning,
+                    seam_strength,
+                    x_T,
+                    step_callback)
 
                 # Restore original settings
                 self.get_make_image(prompt,sampler,steps,cfg_scale,ddim_eta,
@@ -335,7 +353,7 @@ class Inpaint(Img2Img):
 
         if self.pil_image is None or self.pil_mask is None:
             return gen_result
-
+        
         corrected_result = super().repaste_and_color_correct(gen_result, self.pil_image, self.pil_mask, self.mask_blur_radius)
         debug_image(corrected_result, "corrected_result", debug_status=self.enable_image_debugging)
 

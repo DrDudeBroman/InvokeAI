@@ -5,15 +5,6 @@
 # model requires a model config file, a weights file,
 # and the width and height of the images it
 # was trained on.
-diffusers-1.4:
-  description: Diffusers version of Stable Diffusion version 1.4
-  format: diffusers
-  repo_name: CompVis/stable-diffusion-v1-4
-  default: true
-diffusers-1.5:
-  description: Diffusers version of Stable Diffusion version 1.5
-  format: diffusers
-  repo_name: runwayml/stable-diffusion-v1-5
 stable-diffusion-1.5:
   description: The newest Stable Diffusion version 1.5 weight file (4.27 GB)
   weights: models/ldm/stable-diffusion-v1/v1-5-pruned-emaonly.ckpt
@@ -21,6 +12,7 @@ stable-diffusion-1.5:
   width: 512
   height: 512
   vae: ./models/ldm/stable-diffusion-v1/vae-ft-mse-840000-ema-pruned.ckpt
+  default: true
 stable-diffusion-1.4:
   description: Stable Diffusion inference model version 1.4
   config: configs/stable-diffusion/v1-inference.yaml

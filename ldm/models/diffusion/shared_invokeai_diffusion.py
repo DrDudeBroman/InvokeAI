@@ -35,7 +35,6 @@ class InvokeAIDiffuserComponent:
         :param model: the unet model to pass through to cross attention control
         :param model_forward_callback: a lambda with arguments (x, sigma, conditioning_to_apply). will be called repeatedly. most likely, this should simply call model.forward(x, sigma, conditioning)
         """
-        self.conditioning = None
         self.model = model
         self.model_forward_callback = model_forward_callback
         self.cross_attention_control_context = None
@@ -102,11 +101,8 @@ class InvokeAIDiffuserComponent:
         x_twice = torch.cat([x] * 2)
         sigma_twice = torch.cat([sigma] * 2)
         both_conditionings = torch.cat([unconditioning, conditioning])
-        both_results = self.model_forward_callback(x_twice, sigma_twice, both_conditionings)
-        unconditioned_next_x, conditioned_next_x = both_results.chunk(2)
-        if conditioned_next_x.device.type == 'mps':
-            # prevent a result filled with zeros. seems to be a torch bug.
-            conditioned_next_x = conditioned_next_x.clone()
+        unconditioned_next_x, conditioned_next_x = self.model_forward_callback(x_twice, sigma_twice,
+                                                                               both_conditionings).chunk(2)
         return unconditioned_next_x, conditioned_next_x
 
 

@@ -1,7 +1,5 @@
 import math
 import os.path
-from typing import Optional
-
 import torch
 import torch.nn as nn
 from functools import partial
@@ -237,28 +235,26 @@ class SpatialRescaler(nn.Module):
 
 class FrozenCLIPEmbedder(AbstractEncoder):
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
-    tokenizer: CLIPTokenizer
-    transformer: CLIPTextModel
 
     def __init__(
         self,
-        version:str='openai/clip-vit-large-patch14',
-        max_length:int=77,
-        tokenizer:Optional[CLIPTokenizer]=None,
-        transformer:Optional[CLIPTextModel]=None,
+        version='openai/clip-vit-large-patch14',
+        device=choose_torch_device(),
+        max_length=77,
     ):
         super().__init__()
         cache = os.path.join(Globals.root,'models',version)
-        self.tokenizer = tokenizer or CLIPTokenizer.from_pretrained(
+        self.tokenizer = CLIPTokenizer.from_pretrained(
             version,
             cache_dir=cache,
             local_files_only=True
         )
-        self.transformer = transformer or CLIPTextModel.from_pretrained(
+        self.transformer = CLIPTextModel.from_pretrained(
             version,
             cache_dir=cache,
             local_files_only=True
         )
+        self.device = device
         self.max_length = max_length
         self.freeze()
 
@@ -464,14 +460,6 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     def encode(self, text, **kwargs):
         return self(text, **kwargs)
 
-    @property
-    def device(self):
-        return self.transformer.device
-
-    @device.setter
-    def device(self, device):
-        self.transformer.to(device=device)
-
 class WeightedFrozenCLIPEmbedder(FrozenCLIPEmbedder):
 
     fragment_weights_key = "fragment_weights"
@@ -560,7 +548,7 @@ class WeightedFrozenCLIPEmbedder(FrozenCLIPEmbedder):
 
             #print(f"assembled tokens for '{fragments}' into tensor of shape {lerped_embeddings.shape}")
 
-            # append to batch
+            # append to batch 
             batch_z = lerped_embeddings.unsqueeze(0) if batch_z is None else torch.cat([batch_z, lerped_embeddings.unsqueeze(0)], dim=1)
             batch_tokens = tokens.unsqueeze(0) if batch_tokens is None else torch.cat([batch_tokens, tokens.unsqueeze(0)], dim=1)
 

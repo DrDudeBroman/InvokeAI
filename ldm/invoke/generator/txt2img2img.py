@@ -2,15 +2,14 @@
 ldm.invoke.generator.txt2img inherits from ldm.invoke.generator
 '''
 
-import math
-
 import torch
-from PIL import Image
-
+import numpy as  np
+import math
 from ldm.invoke.generator.base import Generator
-from ldm.invoke.generator.omnibus import Omnibus
 from ldm.models.diffusion.ddim import DDIMSampler
-
+from ldm.invoke.generator.omnibus import Omnibus
+from ldm.models.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserComponent
+from PIL import Image
 
 class Txt2Img2Img(Generator):
     def __init__(self, model, precision):

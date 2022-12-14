@@ -1,31 +1,32 @@
-import base64
+import eventlet
 import glob
-import io
-import json
-import math
-import mimetypes
 import os
 import shutil
+import mimetypes
 import traceback
-from threading import Event
-from uuid import uuid4
+import math
+import io
+import base64
+import os
+import json
 
-import eventlet
-from PIL import Image
-from PIL.Image import Image as ImageType
+from werkzeug.utils import secure_filename
 from flask import Flask, redirect, send_from_directory, request, make_response
 from flask_socketio import SocketIO
-from werkzeug.utils import secure_filename
+from PIL import Image, ImageOps
+from PIL.Image import Image as ImageType
+from uuid import uuid4
+from threading import Event
 
+from ldm.invoke.args import Args, APP_ID, APP_VERSION, calculate_init_img_hash
+from ldm.invoke.pngwriter import PngWriter, retrieve_metadata
+from ldm.invoke.prompt_parser import split_weighted_subprompts
+from ldm.invoke.generator.inpaint import infill_methods
+
+from backend.modules.parameters import parameters_to_command
 from backend.modules.get_canvas_generation_mode import (
     get_canvas_generation_mode,
 )
-from backend.modules.parameters import parameters_to_command
-from ldm.invoke.args import Args, APP_ID, APP_VERSION, calculate_init_img_hash
-from ldm.invoke.generator.diffusers_pipeline import PipelineIntermediateState
-from ldm.invoke.generator.inpaint import infill_methods
-from ldm.invoke.pngwriter import PngWriter, retrieve_metadata
-from ldm.invoke.prompt_parser import split_weighted_subprompts
 
 # Loading Arguments
 opt = Args()
@@ -847,9 +848,7 @@ class InvokeAIWebServer:
                 init_img_path = self.get_image_path_from_url(init_img_url)
                 generation_parameters["init_img"] = Image.open(init_img_path).convert('RGB')
 
-            def image_progress(progress_state: PipelineIntermediateState):
-                step = progress_state.step
-                sample = progress_state.latents
+            def image_progress(sample, step):
                 if self.canceled.is_set():
                     raise CanceledException
 

@@ -1,47 +1,46 @@
 # Copyright (c) 2022 Lincoln D. Stein (https://github.com/lstein)
+import pyparsing
 # Derived from source code carrying the following copyrights
 # Copyright (c) 2022 Machine Vision and Learning Group, LMU Munich
 # Copyright (c) 2022 Robin Rombach and Patrick Esser and contributors
 
-import gc
-import os
+import torch
+import numpy as np
 import random
+import os
+import time
 import re
 import sys
-import time
 import traceback
-
-import cv2
-import numpy as np
-import skimage
-import torch
 import transformers
-from PIL import Image, ImageOps
-from diffusers.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
-from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
-from diffusers.schedulers.scheduling_ipndm import IPNDMScheduler
-from diffusers.schedulers.scheduling_lms_discrete import LMSDiscreteScheduler
-from diffusers.schedulers.scheduling_pndm import PNDMScheduler
+import io
+import gc
+import hashlib
+import cv2
+import skimage
+
 from omegaconf import OmegaConf
+from ldm.invoke.generator.base import downsampling
+from PIL import Image, ImageOps
+from torch import nn
 from pytorch_lightning import seed_everything, logging
 
-from ldm.invoke.args import metadata_from_png
-from ldm.invoke.concepts_lib import Concepts
-from ldm.invoke.conditioning import get_uc_and_c_and_ec
-from ldm.invoke.devices import choose_torch_device, choose_precision
+from ldm.invoke.prompt_parser import PromptParser
+from ldm.util import instantiate_from_config
 from ldm.invoke.globals import Globals
-from ldm.invoke.image_util import InitImageResizer
-from ldm.invoke.model_cache import ModelCache
-from ldm.invoke.pngwriter import PngWriter
-from ldm.invoke.seamless import configure_model_padding
-from ldm.invoke.txt2mask import Txt2Mask
 from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.ksampler import KSampler
 from ldm.models.diffusion.plms import PLMSSampler
-
-
+from ldm.models.diffusion.ksampler import KSampler
+from ldm.invoke.pngwriter import PngWriter
+from ldm.invoke.args import metadata_from_png
+from ldm.invoke.image_util import InitImageResizer
+from ldm.invoke.devices import choose_torch_device, choose_precision
+from ldm.invoke.conditioning import get_uc_and_c_and_ec
+from ldm.invoke.model_cache import ModelCache
+from ldm.invoke.seamless import configure_model_padding
+from ldm.invoke.txt2mask import Txt2Mask, SegmentedGrayscale
+from ldm.invoke.concepts_lib import Concepts
+    
 def fix_func(orig):
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         def new_func(*args, **kw):
@@ -236,7 +235,7 @@ class Generate:
             except Exception:
                 print('** An error was encountered while installing the safety checker:')
                 print(traceback.format_exc())
-
+                
     def prompt2png(self, prompt, outdir, **kwargs):
         """
         Takes a prompt and an output directory, writes out the requested number
@@ -330,7 +329,7 @@ class Generate:
             infill_method = infill_methods[0], # The infill method to use
             force_outpaint: bool = False,
             enable_image_debugging = False,
-
+            
             **args,
     ):   # eat up additional cruft
         """
@@ -373,7 +372,7 @@ class Generate:
             def process_image(image,seed):
                 image.save(f{'images/seed.png'})
 
-        The code used to save images to a directory can be found in ldm/invoke/pngwriter.py.
+        The code used to save images to a directory can be found in ldm/invoke/pngwriter.py. 
         It contains code to create the requested output directory, select a unique informative
         name for each image, and write the prompt into the PNG metadata.
         """
@@ -403,10 +402,7 @@ class Generate:
         width = width or self.width
         height = height or self.height
 
-        if isinstance(model, DiffusionPipeline):
-            configure_model_padding(model.unet, seamless, seamless_axes)
-        else:
-            configure_model_padding(model, seamless, seamless_axes)
+        configure_model_padding(model, seamless, seamless_axes)
 
         assert cfg_scale > 1.0, 'CFG_Scale (-C) must be >1.0'
         assert threshold >= 0.0, '--threshold must be >=0.0'
@@ -593,7 +589,7 @@ class Generate:
         seed = opt.seed or args.seed
         if seed is None or seed < 0:
             seed = random.randrange(0, np.iinfo(np.uint32).max)
-
+        
         prompt = opt.prompt or args.prompt or ''
         print(f'>> using seed {seed} and prompt "{prompt}" for {image_path}')
 
@@ -645,7 +641,7 @@ class Generate:
 
             opt.seed = seed
             opt.prompt = prompt
-
+            
             if len(extend_instructions) > 0:
                 restorer = Outcrop(image,self,)
                 return restorer.process (
@@ -687,7 +683,7 @@ class Generate:
                 image_callback = callback,
                 prefix         = prefix
             )
-
+                
         elif tool is None:
             print(f'* please provide at least one postprocessing option, such as -G or -U')
             return None
@@ -710,13 +706,13 @@ class Generate:
 
         if embiggen is not None:
             return self._make_embiggen()
-
+            
         if inpainting_model_in_use:
             return self._make_omnibus()
 
         if ((init_image is not None) and (mask_image is not None)) or force_outpaint:
             return self._make_inpaint()
-
+        
         if init_image is not None:
             return self._make_img2img()
 
@@ -747,7 +743,7 @@ class Generate:
         if self._has_transparency(image):
             self._transparency_check_and_warning(image, mask, force_outpaint)
             init_mask = self._create_init_mask(image, width, height, fit=fit)
-
+            
         if (image.width * image.height) > (self.width * self.height) and self.size_matters:
             print(">> This input is larger than your defaults. If you run out of memory, please use a smaller image.")
             self.size_matters = False
@@ -763,7 +759,7 @@ class Generate:
 
         if invert_mask:
             init_mask = ImageOps.invert(init_mask)
-
+            
         return init_image,init_mask
 
     # lots o' repeated code here! Turn into a make_func()
@@ -822,7 +818,7 @@ class Generate:
         self.set_model(self.model_name)
 
     def set_model(self,model_name):
-        """
+        """ 
         Given the name of a model defined in models.yaml, will load and initialize it
         and return the model object. Previously-used models will be cached.
         """
@@ -834,7 +830,7 @@ class Generate:
         if not cache.valid_model(model_name):
             print(f'** "{model_name}" is not a known model name. Please check your models.yaml file')
             return self.model
-
+        
         cache.print_vram_usage()
 
         # have to get rid of all references to model in order
@@ -843,7 +839,7 @@ class Generate:
         self.sampler = None
         self.generators = {}
         gc.collect()
-
+        
         model_data = cache.get_model(model_name)
         if model_data is None:  # restore previous
             model_data = cache.get_model(self.model_name)
@@ -856,15 +852,15 @@ class Generate:
 
         # uncache generators so they pick up new models
         self.generators = {}
-
+        
         seed_everything(random.randrange(0, np.iinfo(np.uint32).max))
         if self.embedding_path is not None:
             self.model.embedding_manager.load(
                 self.embedding_path, self.precision == 'float32' or self.precision == 'autocast'
             )
 
+        self._set_sampler()
         self.model_name = model_name
-        self._set_sampler()  # requires self.model_name to be set first
         return self.model
 
     def load_concepts(self,concepts:list[str]):
@@ -905,7 +901,7 @@ class Generate:
                                 image_callback = None,
                                 prefix = None,
     ):
-
+            
         for r in image_list:
             image, seed = r
             try:
@@ -915,7 +911,7 @@ class Generate:
                             if self.gfpgan is None:
                                 print('>> GFPGAN not found. Face restoration is disabled.')
                             else:
-                              image = self.gfpgan.process(image, strength, seed)
+                              image = self.gfpgan.process(image, strength, seed)                              
                         if facetool == 'codeformer':
                             if self.codeformer is None:
                                 print('>> CodeFormer not found. Face restoration is disabled.')
@@ -966,15 +962,9 @@ class Generate:
     def sample_to_lowres_estimated_image(self, samples):
         return self._make_base().sample_to_lowres_estimated_image(samples)
 
-    def _set_sampler(self):
-        if isinstance(self.model, DiffusionPipeline):
-            return self._set_scheduler()
-        else:
-            return self._set_sampler_legacy()
-
     # very repetitive code - can this be simplified? The KSampler names are
     # consistent, at least
-    def _set_sampler_legacy(self):
+    def _set_sampler(self):
         msg = f'>> Setting Sampler to {self.sampler_name}'
         if self.sampler_name == 'plms':
             self.sampler = PLMSSampler(self.model, device=self.device)
@@ -1001,47 +991,6 @@ class Generate:
             self.sampler = PLMSSampler(self.model, device=self.device)
 
         print(msg)
-
-    def _set_scheduler(self):
-        default = self.model.scheduler
-
-        higher_order_samplers = [
-            'k_dpm_2',
-            'k_dpm_2_a',
-            'k_heun',
-            'plms',   # Its first step is like Heun
-        ]
-        scheduler_map = dict(
-            ddim=DDIMScheduler,
-            ipndm=IPNDMScheduler,
-            k_euler=EulerDiscreteScheduler,
-            k_euler_a=EulerAncestralDiscreteScheduler,
-            k_lms=LMSDiscreteScheduler,
-            pndm=PNDMScheduler,
-        )
-
-        if self.sampler_name in scheduler_map:
-            sampler_class = scheduler_map[self.sampler_name]
-            msg = f'>> Setting Sampler to {self.sampler_name} ({sampler_class.__name__})'
-            self.sampler = sampler_class.from_pretrained(
-                self.model_cache.model_name_or_path(self.model_name),
-                subfolder="scheduler"
-            )
-        elif self.sampler_name in higher_order_samplers:
-            msg = (f'>> Unsupported Sampler: {self.sampler_name} '
-                  f'— diffusers does not yet support higher-order samplers, '
-                  f'Defaulting to {default}')
-            self.sampler = default
-        else:
-            msg = (f'>> Unsupported Sampler: {self.sampler_name} '
-                  f'Defaulting to {default}')
-            self.sampler = default
-
-        print(msg)
-
-        if not hasattr(self.sampler, 'uses_inpainting_model'):
-            # FIXME: terrible kludge!
-            self.sampler.uses_inpainting_model = lambda: False
 
     def _load_img(self, img)->Image:
         if isinstance(img, Image.Image):
